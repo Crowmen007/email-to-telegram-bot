@@ -11,10 +11,10 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Конфигурация
-TELEGRAM_BOT_TOKEN = "8056554842:AAG7d5-Bv-3j7Uz3YLfeBajrLbGPegQs9Ss"
-YANDEX_EMAIL = "crowmen007@yandex.ru"
-YANDEX_PASSWORD = "ydzekkgbmyvspklg"
-TARGET_EMAIL = "sladait@yandex.ru"  # Адрес, с которого принимаются письма
+TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+YANDEX_EMAIL = "YANDEX_EMAIL"
+YANDEX_PASSWORD = "YANDEX_PASSWORD"
+TARGET_EMAIL = "TARGET_EMAIL"  # Адрес, с которого принимаются письма
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
