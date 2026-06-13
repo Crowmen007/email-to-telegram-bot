@@ -2,19 +2,26 @@
 """
 email-to-telegram-bot — уведомления в Telegram о новых письмах Яндекс-почты.
 
-Каждые POLL_INTERVAL секунд опрашивает IMAP Яндекса, берёт ВСЕ непрочитанные
-письма (опционально только от TARGET_EMAIL), пересылает тему/тело в Telegram
-и помечает их прочитанными. Секреты — в .env, в коде их нет.
+Каждые POLL_INTERVAL секунд опрашивает IMAP, берёт ВСЕ непрочитанные письма
+(опционально только от TARGET_EMAIL), пересылает их в Telegram и помечает
+прочитанными. HTML-письма разворачиваются в аккуратное сообщение с лёгкой
+Telegram-разметкой. Секреты — в .env, в коде их нет.
 """
 
 import os
+import re
 import time
 import logging
 import threading
+import subprocess
+import tempfile
 import imaplib
 import email
+import html as ihtml
+from io import BytesIO
+from html.parser import HTMLParser
 from email.header import decode_header
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 
 import telebot
 from dotenv import load_dotenv
@@ -30,6 +37,8 @@ TARGET_EMAIL = os.environ.get("TARGET_EMAIL", "").strip()  # пусто = при
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.yandex.ru")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 TELEGRAM_PROXY = os.environ.get("TELEGRAM_PROXY", "").strip()  # напр. http://HOST:PORT или socks5://HOST:PORT
+RENDER_HTML = os.environ.get("RENDER_HTML", "1").strip() not in ("0", "false", "no", "")  # HTML→картинка
+RENDER_WIDTH = int(os.environ.get("RENDER_WIDTH", "600"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +52,92 @@ if TELEGRAM_PROXY:
     log.info("Telegram через прокси: %s", TELEGRAM_PROXY)
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+
+TG_LIMIT = 4096
+
+
+# ── HTML → Telegram-разметка ──────────────────────────────────────────────
+# Telegram HTML понимает только <b> <i> <u> <s> <code> <pre> <a>. Конвертер
+# ставит переносы на блочных тегах, разделяет ячейки таблиц и сохраняет
+# жирный/курсив/зачёркнутый (в т.ч. style="...line-through...").
+_BLOCK = {"p", "div", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
+          "li", "ul", "ol", "section", "header", "footer", "article", "blockquote"}
+_VOID = {"br", "img", "hr", "input", "meta", "link", "area", "base",
+         "col", "embed", "source", "track", "wbr"}
+_EMPH = {"b": "b", "strong": "b", "i": "i", "em": "i",
+         "s": "s", "strike": "s", "del": "s"}
+
+
+class _HtmlToTg(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []
+        self.skip = 0          # внутри <style>/<script>
+        self.stack = []        # (tag, emphasis|None) для балансировки
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("style", "script"):
+            self.skip += 1
+            return
+        if tag == "br":
+            self.out.append("\n")
+            return
+        if tag in _VOID:
+            return
+        if tag in _BLOCK:
+            self.out.append("\n")
+        if tag in ("td", "th") and self.out and not self.out[-1].endswith(("\n", "\t", " ")):
+            self.out.append("\t")
+        emph = _EMPH.get(tag)
+        if emph is None:
+            style = dict(attrs).get("style", "") or ""
+            if "line-through" in style:
+                emph = "s"
+        if emph:
+            self.out.append("<%s>" % emph)
+        self.stack.append((tag, emph))
+
+    def handle_endtag(self, tag):
+        if tag in ("style", "script"):
+            if self.skip:
+                self.skip -= 1
+            return
+        if tag in _VOID:
+            return
+        while self.stack:
+            t, emph = self.stack.pop()
+            if emph:
+                self.out.append("</%s>" % emph)
+            if t == tag:
+                break
+        if tag in _BLOCK:
+            self.out.append("\n")
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        data = re.sub(r"\s+", " ", data)   # HTML схлопывает пробелы/переносы
+        if data.strip() or data == " ":
+            self.out.append(ihtml.escape(data, quote=False))
+
+
+def html_to_tg(html_src):
+    p = _HtmlToTg()
+    p.feed(html_src)
+    p.close()
+    text = "".join(p.out)
+    res = []
+    for ln in text.split("\n"):
+        ln = ln.replace("\t", " · ")                 # ячейки таблицы → разделитель
+        ln = re.sub(r" +", " ", ln).strip()
+        ln = re.sub(r"(?:\s*·\s*){2,}", " · ", ln)    # схлопнуть пустые ячейки
+        ln = ln.strip(" ·").strip()
+        if ln == "" and (not res or res[-1] == ""):
+            continue
+        res.append(ln)
+    while res and res[-1] == "":
+        res.pop()
+    return "\n".join(res).strip()
 
 
 def _decode(value):
@@ -61,39 +156,114 @@ def _decode(value):
     return "".join(parts)
 
 
-def _extract_body(msg):
-    """Достаёт текстовое тело письма (предпочитая text/plain)."""
-    if msg.is_multipart():
-        html_fallback = ""
-        for part in msg.walk():
-            if "attachment" in str(part.get("Content-Disposition", "")):
-                continue
-            ctype = part.get_content_type()
+_RU_MONTHS = ["", "января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def _ru_date(raw):
+    """RFC2822-дата письма → '14 июня 2026, 01:26' (без английских названий)."""
+    if not raw:
+        return ""
+    try:
+        dt = parsedate_to_datetime(raw)
+        return "%d %s %d, %02d:%02d" % (dt.day, _RU_MONTHS[dt.month], dt.year, dt.hour, dt.minute)
+    except Exception:
+        return raw
+
+
+def _get_part(msg, ctype):
+    for part in msg.walk():
+        if part.get_content_type() == ctype and "attachment" not in str(part.get("Content-Disposition", "")):
             payload = part.get_payload(decode=True)
             if payload is None:
                 continue
             charset = part.get_content_charset() or "utf-8"
-            text = payload.decode(charset, errors="ignore")
-            if ctype == "text/plain":
-                return text
-            if ctype == "text/html" and not html_fallback:
-                html_fallback = text
-        return html_fallback
-    payload = msg.get_payload(decode=True)
-    if payload is None:
-        return ""
-    charset = msg.get_content_charset() or "utf-8"
-    return payload.decode(charset, errors="ignore")
+            return payload.decode(charset, errors="ignore")
+    return None
+
+
+def _body_for_tg(msg):
+    """Тело письма как Telegram-HTML. Предпочитаем HTML-часть (text/plain от 1С
+    приходит слипшимся), иначе экранируем plain."""
+    html_src = _get_part(msg, "text/html")
+    if html_src:
+        body = html_to_tg(html_src)
+        if body:
+            return body
+    plain = _get_part(msg, "text/plain") or ""
+    return ihtml.escape(plain.strip(), quote=False)
 
 
 def _format(msg):
-    subject = _decode(msg.get("Subject"))
-    from_ = _decode(msg.get("From"))
-    date_ = msg.get("Date", "")
-    body = _extract_body(msg).strip()
-    if len(body) > 3000:
-        body = body[:3000] + "…"
-    return f"📧 Новое письмо\nТема: {subject}\nОт: {from_}\nДата: {date_}\n\n{body}"
+    subject = ihtml.escape(_decode(msg.get("Subject")), quote=False)
+    from_ = ihtml.escape(_decode(msg.get("From")), quote=False)
+    date_ = ihtml.escape(_ru_date(msg.get("Date", "")), quote=False)
+    body = _body_for_tg(msg)
+    header = "📧 <b>%s</b>\n👤 %s\n🕒 %s" % (subject, from_, date_)
+    msg_text = header + "\n\n" + body
+    if len(msg_text) > TG_LIMIT:
+        msg_text = msg_text[:TG_LIMIT - 1].rsplit("\n", 1)[0] + "\n…"
+    return msg_text
+
+
+def _send(text):
+    """Отправка с разметкой; при ошибке парсинга — fallback на чистый текст."""
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID, text, parse_mode="HTML",
+                         disable_web_page_preview=True)
+        return True
+    except Exception as e:
+        log.warning("HTML-отправка не прошла (%s) — шлю чистым текстом", e)
+        plain = ihtml.unescape(re.sub(r"<[^>]+>", "", text))
+        bot.send_message(TELEGRAM_CHAT_ID, plain[:TG_LIMIT])
+        return True
+
+
+def render_html_png(html_src):
+    """Рендерит HTML письма в PNG через wkhtmltoimage (headless, xvfb)."""
+    hp = pp = None
+    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
+        f.write(html_src)
+        hp = f.name
+    pp = hp + ".png"
+    try:
+        subprocess.run(
+            ["wkhtmltoimage", "--quality", "92",
+             "--width", str(RENDER_WIDTH), "--encoding", "utf-8",
+             "--disable-javascript", hp, pp],
+            check=True, capture_output=True, timeout=90,
+        )
+        with open(pp, "rb") as fp:
+            return fp.read()
+    finally:
+        for p in (hp, pp):
+            try:
+                if p:
+                    os.remove(p)
+            except OSError:
+                pass
+
+
+def _caption(msg):
+    subject = ihtml.escape(_decode(msg.get("Subject")), quote=False)
+    from_ = ihtml.escape(_decode(msg.get("From")), quote=False)
+    date_ = ihtml.escape(_ru_date(msg.get("Date", "")), quote=False)
+    return ("📧 <b>%s</b>\n👤 %s · 🕒 %s" % (subject, from_, date_))[:1024]
+
+
+def _deliver(msg):
+    """HTML-письмо → картинка (вид 1:1); иначе/при сбое — текстовый формат."""
+    if RENDER_HTML:
+        html_src = _get_part(msg, "text/html")
+        if html_src:
+            try:
+                png = render_html_png(html_src)
+                bot.send_photo(TELEGRAM_CHAT_ID, BytesIO(png),
+                               caption=_caption(msg), parse_mode="HTML")
+                return
+            except Exception as e:
+                log.warning("Рендер HTML→картинку не удался (%s) — шлю текстом", e)
+    _send(_format(msg))
 
 
 def process_unseen():
@@ -133,9 +303,8 @@ def process_unseen():
                 if addr.lower() != TARGET_EMAIL.lower():
                     continue
 
-            text = _format(msg)
             try:
-                bot.send_message(TELEGRAM_CHAT_ID, text[:4096])
+                _deliver(msg)
             except Exception as e:
                 log.error("Не отправилось в Telegram (%s) — письмо оставляю непрочитанным", e)
                 continue  # НЕ помечаем Seen → повторим в следующем цикле
@@ -166,8 +335,8 @@ def poll_loop():
 def send_welcome(message):
     bot.send_message(
         message.chat.id,
-        f"Бот запущен. Слежу за почтой {YANDEX_EMAIL} и шлю сюда новые письма"
-        + (f" от {TARGET_EMAIL}." if TARGET_EMAIL else "."),
+        "Бот запущен. Слежу за почтой %s и шлю сюда новые письма%s"
+        % (YANDEX_EMAIL, (" от %s." % TARGET_EMAIL) if TARGET_EMAIL else "."),
     )
     log.info("/start от chat_id=%s", message.chat.id)
 
