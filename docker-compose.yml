@@ -1,0 +1,11 @@
+services:
+  email-bot:
+    build: .
+    container_name: email-to-telegram-bot
+    env_file: .env
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
