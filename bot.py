@@ -273,10 +273,12 @@ def process_unseen():
         mail.login(YANDEX_EMAIL, YANDEX_PASSWORD)
         mail.select("inbox")
 
-        criteria = ["UNSEEN"]
-        if TARGET_EMAIL:
-            criteria += ["FROM", TARGET_EMAIL]
-        status, data = mail.search(None, *criteria)
+        # На сервере ищем только UNSEEN. Фильтр по отправителю — на клиенте ниже
+        # (parseaddr-проверка). Серверный SEARCH FROM на Яндексе НЕЛЬЗЯ: он бьёт
+        # по токенам и не матчит полный адрес "user@domain.tld"
+        # (напр. SEARCH FROM "user@yandex.ru" -> 0 результатов при наличии письма),
+        # из-за чего письма молча терялись.
+        status, data = mail.search(None, "UNSEEN")
         if status != "OK":
             log.error("IMAP search вернул %s", status)
             return
